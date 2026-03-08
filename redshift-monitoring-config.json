@@ -1,0 +1,7 @@
+{
+  "queries_waiting_threshold": 5,
+  "queries_in_queue_threshold": 10,
+  "queries_waiting_long_threshold": 1,
+  "evaluation_periods": 5,
+  "alerts_enabled": true
+}

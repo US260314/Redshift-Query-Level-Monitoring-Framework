@@ -1,0 +1,441 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Redshift query-level WLM monitoring framework
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: dev
+    AllowedPattern: '^[a-z0-9-]+$'
+
+  ProjectName:
+    Type: String
+    Default: redshift-monitoring
+    AllowedPattern: '^[a-z0-9-]+$'
+
+  LambdaRuntime:
+    Type: String
+    Default: python3.12
+
+  LambdaTimeout:
+    Type: Number
+    Default: 120
+
+  ScheduleExpression:
+    Type: String
+    Default: rate(1 minute)
+
+  NotificationEmail:
+    Type: String
+    Default: alerts@example.com
+
+  RedshiftClusterIdentifier:
+    Type: String
+    Description: Redshift cluster identifier
+
+  RedshiftDatabase:
+    Type: String
+    Default: dev
+
+  RedshiftDbUser:
+    Type: String
+    Description: Database user for Data API
+
+Resources:
+  MonitoringBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-${EnvironmentName}-${AWS::AccountId}-${AWS::Region}-state'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+
+  MonitoringTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-${EnvironmentName}-alerts'
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref NotificationEmail
+
+  MonitoringStateTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-${EnvironmentName}-state'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: ClusterId
+          AttributeType: S
+        - AttributeName: MonitorName
+          AttributeType: S
+      KeySchema:
+        - AttributeName: ClusterId
+          KeyType: HASH
+        - AttributeName: MonitorName
+          KeyType: RANGE
+      SSESpecification:
+        SSEEnabled: true
+
+  MonitoringConfigBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref MonitoringBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !Sub 'arn:aws:s3:::${MonitoringBucket}'
+              - !Sub 'arn:aws:s3:::${MonitoringBucket}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+
+  MonitoringLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${EnvironmentName}-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: !Sub '${ProjectName}-${EnvironmentName}-lambda-policy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: 'arn:aws:logs:*:*:*'
+              - Effect: Allow
+                Action:
+                  - redshift-data:ExecuteStatement
+                  - redshift-data:DescribeStatement
+                  - redshift-data:GetStatementResult
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - redshift:DescribeClusters
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource:
+                  - !Sub 'arn:aws:s3:::${MonitoringBucket}/*'
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                Resource: !GetAtt MonitoringStateTable.Arn
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref MonitoringTopic
+
+  ExecutorLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${EnvironmentName}-executor'
+      Runtime: !Ref LambdaRuntime
+      Timeout: !Ref LambdaTimeout
+      Handler: index.lambda_handler
+      Role: !GetAtt MonitoringLambdaRole.Arn
+      Environment:
+        Variables:
+          STATE_BUCKET: !Ref MonitoringBucket
+          STATE_PREFIX: state
+          CONFIG_BUCKET: !Ref MonitoringBucket
+          CONFIG_KEY: config/redshift-monitoring-config.json
+          METRIC_NAMESPACE: Custom/RedshiftMonitoring
+          REDSHIFT_CLUSTER_ID: !Ref RedshiftClusterIdentifier
+          REDSHIFT_DATABASE: !Ref RedshiftDatabase
+          REDSHIFT_DB_USER: !Ref RedshiftDbUser
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import os
+          import time
+          from datetime import datetime, timezone
+
+          redshift_data = boto3.client('redshift-data')
+          s3 = boto3.client('s3')
+
+          SQL = """
+          SELECT
+              count(1) as queries_in_queue,
+              SUM(CASE WHEN state = 'QueuedWaiting' THEN 1 ELSE 0 END) as queries_waiting,
+              SUM(CASE WHEN wait_secs > 300 THEN 1 ELSE 0 END) as queries_waiting_long
+          FROM admin.v_edw_whats_running_now
+          """
+
+          def execute_query(cluster_id, database, db_user, sql):
+              response = redshift_data.execute_statement(
+                  ClusterIdentifier=cluster_id,
+                  Database=database,
+                  DbUser=db_user,
+                  Sql=sql
+              )
+              statement_id = response['Id']
+
+              while True:
+                  desc = redshift_data.describe_statement(Id=statement_id)
+                  status = desc['Status']
+                  if status in ('FINISHED', 'FAILED', 'ABORTED'):
+                      break
+                  time.sleep(1)
+
+              if status != 'FINISHED':
+                  raise RuntimeError(f'Redshift statement ended with status: {status}')
+
+              result = redshift_data.get_statement_result(Id=statement_id)
+              record = result['Records'][0]
+              def num(v):
+                  if 'longValue' in v:
+                      return int(v['longValue'])
+                  if 'doubleValue' in v:
+                      return float(v['doubleValue'])
+                  if 'stringValue' in v and v['stringValue'] not in (None, ''):
+                      return float(v['stringValue'])
+                  return 0
+              return {
+                  'queries_in_queue': num(record[0]),
+                  'queries_waiting': num(record[1]),
+                  'queries_waiting_long': num(record[2])
+              }
+
+          def lambda_handler(event, context):
+              cluster_id = os.environ['REDSHIFT_CLUSTER_ID']
+              database = os.environ['REDSHIFT_DATABASE']
+              db_user = os.environ['REDSHIFT_DB_USER']
+              bucket = os.environ['STATE_BUCKET']
+              prefix = os.environ.get('STATE_PREFIX', 'state')
+
+              metrics = execute_query(cluster_id, database, db_user, SQL)
+              payload = {
+                  'cluster_id': cluster_id,
+                  'captured_at_utc': datetime.now(timezone.utc).isoformat(),
+                  'metrics': metrics
+              }
+
+              key = f"{prefix}/{cluster_id}/latest-sample.json"
+              s3.put_object(
+                  Bucket=bucket,
+                  Key=key,
+                  Body=json.dumps(payload).encode('utf-8'),
+                  ContentType='application/json'
+              )
+
+              return payload
+
+  HistoryTrackerLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${EnvironmentName}-history-tracker'
+      Runtime: !Ref LambdaRuntime
+      Timeout: !Ref LambdaTimeout
+      Handler: index.lambda_handler
+      Role: !GetAtt MonitoringLambdaRole.Arn
+      Environment:
+        Variables:
+          STATE_BUCKET: !Ref MonitoringBucket
+          STATE_PREFIX: state
+          CONFIG_BUCKET: !Ref MonitoringBucket
+          CONFIG_KEY: config/redshift-monitoring-config.json
+          DYNAMODB_TABLE: !Ref MonitoringStateTable
+          SNS_TOPIC_ARN: !Ref MonitoringTopic
+          METRIC_NAMESPACE: Custom/RedshiftMonitoring
+          REDSHIFT_CLUSTER_ID: !Ref RedshiftClusterIdentifier
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import os
+          from datetime import datetime, timezone
+
+          s3 = boto3.client('s3')
+          sns = boto3.client('sns')
+          cloudwatch = boto3.client('cloudwatch')
+          dynamodb = boto3.resource('dynamodb')
+
+          def load_json(bucket, key, default=None):
+              try:
+                  obj = s3.get_object(Bucket=bucket, Key=key)
+                  return json.loads(obj['Body'].read())
+              except s3.exceptions.NoSuchKey:
+                  return default
+              except Exception:
+                  return default
+
+          def put_json(bucket, key, payload):
+              s3.put_object(
+                  Bucket=bucket,
+                  Key=key,
+                  Body=json.dumps(payload).encode('utf-8'),
+                  ContentType='application/json'
+              )
+
+          def lambda_handler(event, context):
+              bucket = os.environ['STATE_BUCKET']
+              prefix = os.environ.get('STATE_PREFIX', 'state')
+              config_bucket = os.environ['CONFIG_BUCKET']
+              config_key = os.environ['CONFIG_KEY']
+              table = dynamodb.Table(os.environ['DYNAMODB_TABLE'])
+              topic_arn = os.environ['SNS_TOPIC_ARN']
+              namespace = os.environ['METRIC_NAMESPACE']
+              cluster_id = os.environ['REDSHIFT_CLUSTER_ID']
+              monitor_name = 'wlm-query-monitor'
+
+              config = load_json(config_bucket, config_key, default={
+                  'queries_waiting_threshold': 5,
+                  'queries_in_queue_threshold': 10,
+                  'queries_waiting_long_threshold': 1,
+                  'evaluation_periods': 5,
+                  'alerts_enabled': True
+              })
+
+              latest = load_json(bucket, f'{prefix}/{cluster_id}/latest-sample.json', default=None)
+              if not latest:
+                  return {'message': 'No sample found'}
+
+              metrics = latest['metrics']
+              waiting_breach = metrics['queries_waiting'] >= config['queries_waiting_threshold']
+              queue_breach = metrics['queries_in_queue'] >= config['queries_in_queue_threshold']
+              long_wait_breach = metrics['queries_waiting_long'] >= config['queries_waiting_long_threshold']
+              breached = waiting_breach or queue_breach or long_wait_breach
+
+              state = table.get_item(Key={'ClusterId': cluster_id, 'MonitorName': monitor_name}).get('Item', {
+                  'ClusterId': cluster_id,
+                  'MonitorName': monitor_name,
+                  'BreachCount': 0,
+                  'LastAlertTimestamp': '',
+                  'Status': 'normal'
+              })
+
+              breach_count = int(state.get('BreachCount', 0))
+              if breached:
+                  breach_count += 1
+                  status = 'breach'
+              else:
+                  breach_count = 0
+                  status = 'normal'
+
+              cloudwatch.put_metric_data(
+                  Namespace=namespace,
+                  MetricData=[
+                      {'MetricName': 'QueriesInQueue', 'Value': metrics['queries_in_queue'], 'Unit': 'Count', 'Dimensions': [{'Name': 'ClusterId', 'Value': cluster_id}]},
+                      {'MetricName': 'QueriesWaiting', 'Value': metrics['queries_waiting'], 'Unit': 'Count', 'Dimensions': [{'Name': 'ClusterId', 'Value': cluster_id}]},
+                      {'MetricName': 'QueriesWaitingLong', 'Value': metrics['queries_waiting_long'], 'Unit': 'Count', 'Dimensions': [{'Name': 'ClusterId', 'Value': cluster_id}]},
+                      {'MetricName': 'BreachCount', 'Value': breach_count, 'Unit': 'Count', 'Dimensions': [{'Name': 'ClusterId', 'Value': cluster_id}]}
+                  ]
+              )
+
+              alert_sent = False
+              now = datetime.now(timezone.utc).isoformat()
+              if config.get('alerts_enabled', True) and breach_count >= int(config['evaluation_periods']):
+                  message = {
+                      'cluster_id': cluster_id,
+                      'captured_at_utc': latest['captured_at_utc'],
+                      'queries_in_queue': metrics['queries_in_queue'],
+                      'queries_waiting': metrics['queries_waiting'],
+                      'queries_waiting_long': metrics['queries_waiting_long'],
+                      'breach_count': breach_count,
+                      'thresholds': config
+                  }
+                  sns.publish(
+                      TopicArn=topic_arn,
+                      Subject=f'Redshift WLM alert - {cluster_id}',
+                      Message=json.dumps(message, indent=2)
+                  )
+                  alert_sent = True
+                  breach_count = 0
+
+              item = {
+                  'ClusterId': cluster_id,
+                  'MonitorName': monitor_name,
+                  'BreachCount': breach_count,
+                  'LastAlertTimestamp': now if alert_sent else state.get('LastAlertTimestamp', ''),
+                  'Status': status,
+                  'LastSampleTimestamp': latest['captured_at_utc']
+              }
+              table.put_item(Item=item)
+
+              put_json(bucket, f'{prefix}/{cluster_id}/history/latest-state.json', item)
+
+              return {
+                  'breached': breached,
+                  'alert_sent': alert_sent,
+                  'state': item,
+                  'metrics': metrics
+              }
+
+  ExecutorSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-${EnvironmentName}-executor-schedule'
+      ScheduleExpression: !Ref ScheduleExpression
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt ExecutorLambda.Arn
+          Id: ExecutorLambdaTarget
+
+  HistorySchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-${EnvironmentName}-history-schedule'
+      ScheduleExpression: !Ref ScheduleExpression
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt HistoryTrackerLambda.Arn
+          Id: HistoryTrackerLambdaTarget
+
+  ExecutorInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ExecutorLambda
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ExecutorSchedule.Arn
+
+  HistoryInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref HistoryTrackerLambda
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt HistorySchedule.Arn
+
+Outputs:
+  BucketName:
+    Value: !Ref MonitoringBucket
+  DynamoDBTableName:
+    Value: !Ref MonitoringStateTable
+  ExecutorLambdaName:
+    Value: !Ref ExecutorLambda
+  HistoryTrackerLambdaName:
+    Value: !Ref HistoryTrackerLambda
+  SnsTopicArn:
+    Value: !Ref MonitoringTopic

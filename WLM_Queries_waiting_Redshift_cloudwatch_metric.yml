@@ -1,0 +1,125 @@
+import boto3
+import os
+import json
+import time
+from botocore.exceptions import ClientError
+
+# Initialize clients
+secrets_client = boto3.client('secretsmanager')
+cloudwatch = boto3.client('cloudwatch')
+redshift_data_client = boto3.client('redshift-data')
+
+# Environment variables
+SECRET_NAME = os.environ['SECRET_NAME']
+REGION_NAME = os.environ['REGION_NAME']
+
+# Fetch credentials from Secrets Manager
+def get_secret(secret_name, region_name):
+    try:
+        response = secrets_client.get_secret_value(SecretId=secret_name)
+        secret = json.loads(response['SecretString'])
+        return secret
+    except ClientError as e:
+        print(f"Error retrieving secret: {e}")
+        raise e
+
+# Execute Redshift query using the dbClusterIdentifier
+def execute_redshift_query(query, cluster_id, username, db_name):
+    try:
+        response = redshift_data_client.execute_statement(
+            ClusterIdentifier=cluster_id,
+            Database=db_name,
+            DbUser=username,
+            Sql=query,
+        )
+        return response['Id']
+    except ClientError as e:
+        print(f"Error executing Redshift query: {e}")
+        raise e
+
+# Check the query status using DescribeStatement
+def check_query_status(query_id):
+    try:
+        response = redshift_data_client.describe_statement(Id=query_id)
+        return response['Status']
+    except ClientError as e:
+        print(f"Error checking query status: {e}")
+        raise e
+
+# Get query result from Redshift once the query is finished
+def get_query_result(query_id):
+    while True:
+        status = check_query_status(query_id)
+        if status == "FINISHED":
+            try:
+                result = redshift_data_client.get_statement_result(Id=query_id)
+                return result
+            except ClientError as e:
+                print(f"Error retrieving Redshift query result: {e}")
+                raise e
+        elif status == "FAILED":
+            raise Exception(f"Query {query_id} failed.")
+        elif status == "CANCELLED":
+            raise Exception(f"Query {query_id} was cancelled.")
+        else:
+            print(f"Query {query_id} is still running. Status: {status}. Retrying in 5 seconds.")
+            time.sleep(5)
+
+def lambda_handler(event, context):
+    # Get Redshift credentials from Secrets Manager
+    secret = get_secret(SECRET_NAME, REGION_NAME)
+
+    # Extract required credentials from the secret
+    cluster_id = secret['dbClusterIdentifier']
+    username = secret['username']
+    db_name = secret['dbname'] if 'dbname' in secret else 'default_db_name'
+
+    query = """
+    SELECT count(1) as queries_in_queue,
+        SUM(CASE WHEN state = 'QueuedWaiting' THEN 1 ELSE 0 END) as queries_waiting,
+        SUM(CASE WHEN wait_secs > 300 THEN 1 ELSE 0 END) as queries_waiting_long
+    FROM admin.v_edw_whats_running_now;
+    """
+
+    # Execute the query on Redshift
+    query_id = execute_redshift_query(query, cluster_id, username, db_name)
+
+    # Check status and get result once the query is finished
+    result = get_query_result(query_id)
+    
+    # Extract query result values
+    queries_in_queue = int(result['Records'][0][0]['longValue'])
+    queries_waiting = int(result['Records'][0][1]['longValue'])
+    queries_waiting_long = int(result['Records'][0][2]['longValue'])
+
+    # Publish the metrics to CloudWatch for each run
+    cloudwatch.put_metric_data(
+        Namespace='Redshift',
+        MetricData=[
+            {
+                'MetricName': 'RedshiftWLMQueueQueriesInQueue',
+                'Value': queries_in_queue,
+                'Unit': 'Count'
+            },
+            {
+                'MetricName': 'RedshiftWLMQueueQueriesWaiting',
+                'Value': queries_waiting,
+                'Unit': 'Count'
+            },
+            {
+                'MetricName': 'RedshiftWLMQueueQueriesWaitingLong',
+                'Value': queries_waiting_long,
+                'Unit': 'Count'
+            }
+        ]
+    )
+
+    return {
+        'statusCode': 200,
+        'body': (
+            f'Successfully pushed metrics to CloudWatch. '
+            f'Queries In Queue: {queries_in_queue}, '
+            f'Queries Waiting: {queries_waiting}, '
+            f'Queries Waiting Long: {queries_waiting_long}'
+        )
+    }
